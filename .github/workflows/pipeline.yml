@@ -1,0 +1,47 @@
+name: Daily PVP Pipeline
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Modalità"
+        default: "daily"
+        type: choice
+        options: [daily, full, analyze-only, reconcile-only, alert-only]
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+
+      # #3 — Tesseract per OCR PDF scansionati
+      - name: Install system deps (Tesseract + Poppler)
+        run: sudo apt-get install -y tesseract-ocr tesseract-ocr-ita poppler-utils
+
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install chromium --with-deps
+
+      - name: Run pipeline
+        env:
+          SUPABASE_URL:          ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY:  ${{ secrets.SUPABASE_SERVICE_KEY }}
+          ANTHROPIC_API_KEY:     ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY:        ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          RESEND_API_KEY:        ${{ secrets.RESEND_API_KEY }}
+          ALERT_FROM_EMAIL:      ${{ secrets.ALERT_FROM_EMAIL }}
+        run: python scheduler/daily_pipeline.py --${{ github.event.inputs.mode || 'daily' }}
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_id }}
+          path: "*.log"
+          retention-days: 14
