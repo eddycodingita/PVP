@@ -136,15 +136,16 @@ async function executeTool(name: string, input: Record<string, unknown>) {
     const g: Record<string, {
       count:number; prezzi:number[]; rischi:number[]; sconti:number[]; abusi:number; occupati:number
     }> = {}
-    for (const r of data ?? []) {
-      const k = ((r as unknown) as Record<string,unknown>)[gruppo] as string ?? 'N/D'
+    for (const _r of data ?? []) {
+      const r = (_r as unknown) as Record<string, unknown>
+      const k = r[gruppo] as string ?? 'N/D'
       if (!g[k]) g[k] = { count:0, prezzi:[], rischi:[], sconti:[], abusi:0, occupati:0 }
       g[k].count++
-      if (r.prezzo_base)        g[k].prezzi.push(r.prezzo_base)
-      if (r.punteggio_rischio)  g[k].rischi.push(r.punteggio_rischio)
-      if (r.sconto_perizia_pct) g[k].sconti.push(r.sconto_perizia_pct)
-      if (r.abuso_edilizio)     g[k].abusi++
-      if (r.occupato_terzi)     g[k].occupati++
+      if (r['prezzo_base'])        g[k].prezzi.push(r['prezzo_base'] as number)
+      if (r['punteggio_rischio'])  g[k].rischi.push(r['punteggio_rischio'] as number)
+      if (r['sconto_perizia_pct']) g[k].sconti.push(r['sconto_perizia_pct'] as number)
+      if (r['abuso_edilizio'])     g[k].abusi++
+      if (r['occupato_terzi'])     g[k].occupati++
     }
     const avg = (a: number[]) => a.length ? Math.round(a.reduce((s,v)=>s+v,0)/a.length) : null
     return {
