@@ -45,9 +45,10 @@ class DocumentDownloader:
         # Prendi aste senza dettaglio (mq=null come proxy)
         res = (
             sb.table("aste")
-            .select("id,pvp_id,url_dettaglio")
+            .select("id,pvp_id,url_dettaglio,data_pubblicazione")
             .eq("is_active", True)
             .is_("mq", "null")
+            .order("data_pubblicazione", desc=True)
             .limit(self.limit)
             .execute()
         )
