@@ -163,26 +163,37 @@ class DocumentDownloader:
             except asyncio.TimeoutError:
                 log.warning(f"  Timeout API per {pvp_id}")
 
-            # Intercetta allegati dalla risposta API del lotto
-            # (più affidabile del click in headless)
+            # Intercetta allegati dalla risposta API
+            import urllib.parse
             documenti = []
+            seen_urls = set()
+
             for url_resp, data_resp in api_responses.items():
                 body_resp = data_resp.get("body") or data_resp
-                allegati  = (body_resp.get("allegati") or
-                             body_resp.get("documenti") or
-                             (body_resp.get("lotto") or {}).get("allegati") or [])
-                for a in allegati:
+                if not isinstance(body_resp, dict):
+                     continue
+                # Cerca allegati in tutti i posti possibili
+                allegati_list = []
+                allegati_list += body_resp.get("allegati") or []
+                allegati_list += (body_resp.get("lotto") or {}).get("allegati") or []
+                for bene in (body_resp.get("beni") or []):
+                    allegati_list += bene.get("allegati") or []
+
+                for a in allegati_list:
                     nome = (a.get("nomeFile") or a.get("nome") or
                             a.get("fileName") or "allegato.pdf")
-                    durl = (a.get("url") or a.get("urlDownload") or
-                            a.get("link") or a.get("urlFile"))
-                    if not durl:
-                        # Costruisci URL dal pattern resource-pvp
-                        fn = a.get("nomeFile") or a.get("fileName")
-                        if fn:
-                            import urllib.parse
-                            durl = f"https://resource-pvp.giustizia.it/allegati/{pvp_id}/{urllib.parse.quote(fn)}"
-                    if durl:
+                    # Usa linkAllegato direttamente se disponibile
+                    link = a.get("linkAllegato")
+                    if link:
+                        durl = f"https://resource-pvp.giustizia.it{link}" if link.startswith("/") else link
+                    else:
+                        durl = (a.get("url") or a.get("urlDownload") or a.get("link"))
+                        if not durl:
+                            fn = a.get("nomeFile") or a.get("fileName")
+                            if fn:
+                                durl = f"https://resource-pvp.giustizia.it/allegati/{pvp_id}/{urllib.parse.quote(fn)}"
+                    if durl and durl not in seen_urls:
+                        seen_urls.add(durl)
                         documenti.append({
                             "nome":          str(nome)[:200],
                             "url_originale": durl,
@@ -293,18 +304,35 @@ def _parse_api(data: dict) -> dict:
     if not d.get("mq"):
         d["mq"] = -1  # indica "processato ma mq non disponibile"
 
-    # Referenti
-    referenti = body.get("referenti") or []
+    # Tipo procedura (fallimento, pignoramento, ecc.)
+    procedura = body.get("procedura") or {}
+    if procedura:
+        d["tipo_procedura"] = procedura.get("descTipoRito")
+        d["anno_procedura"] = procedura.get("numeAnnoRg")
+        # numero_procedura dall'anno + numero RG
+        nr = procedura.get("numeRg")
+        anno = procedura.get("numeAnnoRg")
+        if nr and anno:
+            d["numero_procedura"] = f"{nr}/{anno}"
+
+    # Referenti (soggetti nel JSON)
+    referenti = body.get("soggetti") or body.get("referenti") or []
     for r in referenti:
-        ruolo = str(r.get("tipoSoggetto") or r.get("ruolo") or "").lower()
+        ruolo = str(r.get("ruolo") or r.get("tipoSoggetto") or "").upper()
         nome  = f"{r.get('nome','').strip()} {r.get('cognome','').strip()}".strip()
         if not nome:
             nome = r.get("denominazione") or r.get("ragioneSociale") or ""
         if nome:
-            if "giudice"  in ruolo: d["giudice"]  = nome
-            if "delegato" in ruolo: d["delegato"] = nome
-            if "custode"  in ruolo: d["custode"]  = nome
-            if "curatore" in ruolo: d["delegato"] = d.get("delegato") or nome
+            if "GIUDICE"  in ruolo: d["giudice"]  = nome
+            if "DELEGATO" in ruolo: d["delegato"] = nome
+            if "CUSTODE"  in ruolo:
+                d["custode"] = nome
+                # estrai email e telefono custode
+                email = r.get("email")
+                tel   = r.get("telefono")
+                if email: d["custode_email"] = email
+                if tel:   d["custode_tel"]   = tel
+            if "CURATORE" in ruolo: d["delegato"] = d.get("delegato") or nome
 
     return {k: v for k, v in d.items() if v is not None}
 
