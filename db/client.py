@@ -113,8 +113,8 @@ def db_log_price_change(asta_id, pvp_id, old_p, new_p, pct):
 def db_insert_documento(asta_id: str, doc: dict):
     try:
         get_supabase().table("documenti").upsert({
-            "asta_id": asta_id, "nome_file": doc.get("nome"),
-            "tipo": doc.get("tipo", "allegato"), "url_originale": doc.get("url"),
+            "asta_id": asta_id, "nome_file": doc.get("nome") or doc.get("nome_file"),
+"tipo": doc.get("tipo", "allegato"), "url_originale": doc.get("url") or doc.get("url_originale"),
             "scaricato": False, "analizzato": False,
         }, on_conflict="asta_id,url_originale").execute()
     except Exception as e:
