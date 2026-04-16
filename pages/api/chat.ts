@@ -1,5 +1,5 @@
 import type { NextApiRequest, NextApiResponse } from 'next'
-import Anthropic from 'anthropic'
+import Anthropic from '@anthropic-ai/sdk'
 import { createClient } from '@supabase/supabase-js'
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY! })
@@ -137,7 +137,7 @@ async function executeTool(name: string, input: Record<string, unknown>) {
       count:number; prezzi:number[]; rischi:number[]; sconti:number[]; abusi:number; occupati:number
     }> = {}
     for (const r of data ?? []) {
-      const k = (r as Record<string,unknown>)[gruppo] as string ?? 'N/D'
+      const k = ((r as unknown) as Record<string,unknown>)[gruppo] as string ?? 'N/D'
       if (!g[k]) g[k] = { count:0, prezzi:[], rischi:[], sconti:[], abusi:0, occupati:0 }
       g[k].count++
       if (r.prezzo_base)        g[k].prezzi.push(r.prezzo_base)
