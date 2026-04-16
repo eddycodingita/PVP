@@ -1,354 +1,241 @@
 """
-STEP 1-2: Scraping lista annunci + dettaglio di ogni asta.
-
-#1 — Retry con backoff esponenziale su ogni richiesta Playwright.
-#2 — Rilevamento blocco IP / captcha: se la pagina segnala un blocco,
-     lo scraper si ferma e attende prima di riprovare.
-     Se i blocchi si ripetono oltre soglia, la sessione viene riavviata
-     con nuovo user-agent e fingerprint casuale.
+Scraper PVP — strategia ibrida:
+- Lista annunci via API JSON interna (veloce)
+- Dettaglio + allegati via Playwright (necessario)
 """
-import asyncio
-import json
-import logging
-import re
-import random
+import asyncio, json, logging, re, httpx
 from datetime import date, datetime
 from typing import Optional
 from urllib.parse import urljoin
-
 from playwright.async_api import async_playwright, BrowserContext
-
 from db.client import db_asta_exists, db_upsert_asta, db_insert_documento
-from utils.http import playwright_get_with_retry, is_block_response
+from utils.pvp_http import playwright_get_with_retry, is_block_response
 
 log = logging.getLogger("scraper")
 
-BASE_URL = "https://pvp.giustizia.it"
+BASE_URL    = "https://pvp.giustizia.it"
+API_URL     = "https://pvp.giustizia.it/ric-496b258c-986a1b71/ric-ms/ricerca/vendite"
+PAGE_SIZE   = 50
+CONCURRENCY = 3
+DELAY       = 0.5
 
-LIST_URL = (
-    f"{BASE_URL}/pvp/it/lista_annunci.page"
-    "?searchType=searchForm"
-    "&sortProperty=dataPubblicazione,desc"
-    "&sortAlpha=citta,asc"
-    "&searchWith=Ricerca%20Geografica"
-    "&codTipoLotto=IMMOBILI"
-    "&raggioAzione=25"
-    "&nazione=Italia"
-    "&page={page}&size={size}"
-)
-
-PAGE_SIZE    = 20
-CONCURRENCY  = 3
-DELAY_PAGES  = 2.5    # secondi tra pagine lista
-DELAY_DETAIL = 0.7    # secondi tra dettagli
-MAX_CONSEC_BLOCKS = 3  # blocchi consecutivi prima di ruotare identità
-
-# Pool di user agent per rotazione (#2)
 USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
 ]
 
 
 class PVPScraper:
     def __init__(self, only_today: bool = True):
-        self.only_today     = only_today
-        self.today          = date.today().isoformat()
-        self.consec_blocks  = 0   # blocchi consecutivi rilevati
-        self.stats = {"scraped": 0, "new": 0, "skipped": 0, "errors": 0, "blocks": 0}
+        self.only_today = only_today
+        self.today = date.today().isoformat()
+        self.stats = {"scraped": 0, "new": 0, "skipped": 0, "errors": 0}
 
     async def run(self) -> dict:
+        # Step 1: lista via API JSON
+        stubs = await self._fetch_list_api()
+        log.info(f"Annunci trovati via API: {len(stubs)}")
+
+        if not stubs:
+            return self.stats
+
+        # Step 2: dettagli via Playwright
         async with async_playwright() as p:
-            browser, ctx = await self._make_browser(p)
+            import random
+            browser = await p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            ctx = await browser.new_context(
+                user_agent=random.choice(USER_AGENTS),
+                locale="it-IT",
+            )
             try:
-                await self._scrape_all_pages(ctx, browser, p)
+                sem = asyncio.Semaphore(CONCURRENCY)
+                await asyncio.gather(
+                    *[self._process(ctx, sem, s) for s in stubs],
+                    return_exceptions=True,
+                )
             finally:
                 await browser.close()
+
         return self.stats
 
-    # ── Browser factory ────────────────────────────────────────────────
-    async def _make_browser(self, playwright, ua: Optional[str] = None):
-        """Crea browser + context con user-agent casuale."""
-        agent = ua or random.choice(USER_AGENTS)
-        browser = await playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
-                  "--disable-blink-features=AutomationControlled"],
-        )
-        ctx = await browser.new_context(
-            user_agent=agent,
-            locale="it-IT",
-            timezone_id="Europe/Rome",
-            viewport={"width": 1366 + random.randint(0, 200),
-                      "height": 768 + random.randint(0, 100)},
-            # #2 — Maschera il fatto che siamo un browser automatizzato
-            extra_http_headers={
-                "Accept-Language":  "it-IT,it;q=0.9,en;q=0.8",
-                "Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Sec-Fetch-Dest":   "document",
-                "Sec-Fetch-Mode":   "navigate",
-                "Sec-Fetch-Site":   "none",
-            },
-        )
-        # Inietta script per mascherare WebDriver
-        await ctx.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
-        """)
-        log.info(f"  Browser pronto (UA: {agent[:60]}...)")
-        return browser, ctx
+    async def _fetch_list_api(self) -> list[dict]:
+        """Scarica la lista annunci via API JSON — veloce, nessun browser."""
+        stubs = []
+        page  = 0
 
-    # ── STEP 1: Lista paginata ─────────────────────────────────────────
-    async def _scrape_all_pages(self, ctx, browser, playwright):
-        page_num    = 0
-        total_pages = None
+        async with httpx.AsyncClient(timeout=30) as client:
+            while True:
+                payload = {
+                    "language": "it",
+                    "page": page,
+                    "size": PAGE_SIZE,
+                    "sortProperty": "dataPubblicazione",
+                    "sortDirection": "DESC",
+                    "codTipoLotto": "IMMOBILI",
+                    "nazione": "Italia",
+                }
+                try:
+                    r = await client.post(
+                        API_URL,
+                        json=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "Accept":       "application/json",
+                            "User-Agent":   "Mozilla/5.0",
+                        },
+                    )
+                    r.raise_for_status()
+                    data    = r.json()
+                    body    = data.get("body") or {}
+                    content = body.get("content") or []
 
-        while True:
-            url = LIST_URL.format(page=page_num, size=PAGE_SIZE)
-            log.info(f"Lista pagina {page_num + 1}{f'/{total_pages}' if total_pages else ''}")
+                    if not content:
+                        break
 
-            html = await playwright_get_with_retry(ctx, url)
+                    for item in content:
+                        pub_date = item.get("dataPubblicazione", "")
 
-            # #2 — Gestione blocco persistente: ruota identità
-            if html is None or is_block_response(html):
-                self.stats["blocks"] += 1
-                self.consec_blocks   += 1
-                log.warning(f"  Blocco #{self.consec_blocks} rilevato sulla lista")
+                        # Modalità daily: fermati sulle aste di giorni precedenti
+                        if self.only_today and pub_date and pub_date < self.today:
+                            log.info(f"  Data {pub_date} < oggi {self.today} — stop")
+                            return stubs
 
-                if self.consec_blocks >= MAX_CONSEC_BLOCKS:
-                    log.warning("  Troppi blocchi consecutivi — rotazione identità browser")
-                    await browser.close()
-                    browser, ctx = await self._make_browser(playwright)
-                    self.consec_blocks = 0
-                    await asyncio.sleep(30)   # pausa lunga dopo rotazione
-                    continue
-                else:
-                    await asyncio.sleep(15)
-                    continue
+                        # Gestione sicura dell'indirizzo (può essere None)
+                        indirizzo  = item.get("indirizzo") or {}
+                        coordinate = indirizzo.get("coordinate") or {}
 
-            self.consec_blocks = 0  # reset su successo
+                        stubs.append({
+                            "pvp_id":             str(item["id"]),
+                            "url_dettaglio":      f"{BASE_URL}/pvp/it/detail_annuncio.page?idAnnuncio={item['id']}",
+                            "data_pubblicazione": pub_date,
+                            "tribunale":          item.get("tribunale"),
+                            "numero_procedura":   item.get("procedura"),
+                            "lotto":              item.get("numeroLotto"),
+                            "tipologia":          item.get("categoriaLotto"),
+                            "indirizzo":          indirizzo.get("via"),
+                            "comune":             indirizzo.get("citta"),
+                            "provincia":          indirizzo.get("provincia"),
+                            "latitudine":         coordinate.get("latitudine"),
+                            "longitudine":        coordinate.get("longitudine"),
+                            "prezzo_base":        item.get("prezzoBaseAsta"),
+                            "offerta_minima":     item.get("offertaMinima"),
+                            "rialzo_minimo":      item.get("rialzoMinimo"),
+                            "data_vendita":       item.get("dataVendita"),
+                            "descrizione":        item.get("descLotto"),
+                            "occupazione":        _parse_disponibilita(item.get("disponibilita") or []),
+                        })
 
-            stubs, total = _parse_list_html(html)
+                    # FIX: usa totalPages e il flag "last" invece di totalElements
+                    total_pages = body.get("totalPages", 1)
+                    is_last     = body.get("last", True)
 
-            if not stubs:
-                log.info("Nessun annuncio trovato — fine lista.")
-                break
+                    log.info(f"  Pagina {page + 1}/{total_pages} — {len(content)} annunci")
 
-            if total_pages is None and total:
-                total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
-                log.info(f"Totale annunci: {total} — Pagine: {total_pages}")
+                    if is_last or page + 1 >= total_pages:
+                        break
 
-            # ── STEP 2: Dettagli in parallelo ─────────────────────────
-            sem     = asyncio.Semaphore(CONCURRENCY)
-            results = await asyncio.gather(
-                *[self._process_stub(ctx, sem, s) for s in stubs],
-                return_exceptions=True,
-            )
+                    page += 1
+                    await asyncio.sleep(0.5)
 
-            old_count = sum(1 for r in results if r == "OLD")
-            if self.only_today and old_count == len(stubs):
-                log.info("Tutti gli annunci di ieri o prima — stop.")
-                break
+                except Exception as e:
+                    log.error(f"Errore API pagina {page}: {e}")
+                    break
 
-            page_num += 1
-            if total_pages and page_num >= total_pages:
-                break
+        return stubs
 
-            await asyncio.sleep(DELAY_PAGES)
-
-    # ── STEP 2: Dettaglio singola asta ─────────────────────────────────
-    async def _process_stub(self, ctx: BrowserContext, sem: asyncio.Semaphore, stub: dict):
+    async def _process(self, ctx: BrowserContext, sem: asyncio.Semaphore, stub: dict):
         async with sem:
-            url    = stub.get("url_dettaglio")
-            pvp_id = stub.get("pvp_id")
-            if not url:
-                return "SKIP"
+            pvp_id = stub["pvp_id"]
+            url    = stub["url_dettaglio"]
 
-            # Modalità daily: salta aste di giorni precedenti
-            if self.only_today and stub.get("data_pubblicazione"):
-                if stub["data_pubblicazione"][:10] < self.today:
-                    self.stats["skipped"] += 1
-                    return "OLD"
-
-            # Già in DB
-            if pvp_id and db_asta_exists(pvp_id):
+            if db_asta_exists(pvp_id):
                 self.stats["skipped"] += 1
-                return "KNOWN"
+                return
 
             try:
-                await asyncio.sleep(DELAY_DETAIL + random.uniform(0, 0.5))  # jitter umano
-
+                await asyncio.sleep(DELAY)
                 html = await playwright_get_with_retry(ctx, url)
 
-                if html is None:
-                    log.warning(f"  Pagina non caricata dopo retry: {url[:80]}")
+                if not html or is_block_response(html):
                     self.stats["errors"] += 1
-                    return "ERROR"
+                    return
 
-                # #2 — Blocco sul dettaglio
-                if is_block_response(html):
-                    log.warning(f"  Blocco su dettaglio {pvp_id}")
-                    self.stats["blocks"] += 1
-                    self.stats["errors"] += 1
-                    return "BLOCKED"
+                # Arricchisci con dati dal dettaglio HTML
+                detail = _parse_detail_html(html, url)
+                # Merge: i dati API hanno precedenza per i campi base
+                stub.update({k: v for k, v in detail.items() if v and not stub.get(k)})
+                stub["pvp_id"] = pvp_id
 
-                detail          = _parse_detail_html(html, url)
-                detail["pvp_id"] = pvp_id or detail.get("pvp_id")
-                asta_db_id      = db_upsert_asta(detail)
-
+                asta_db_id = db_upsert_asta(stub)
                 for doc in detail.get("documenti", []):
                     db_insert_documento(asta_db_id, doc)
 
                 self.stats["scraped"] += 1
                 self.stats["new"]     += 1
                 log.info(
-                    f"  ✓ {pvp_id} | {detail.get('comune')} | "
-                    f"€{detail.get('prezzo_base') or '?'} | "
+                    f"  ✓ {pvp_id} | {stub.get('comune')} | "
+                    f"€{stub.get('prezzo_base')} | "
                     f"{len(detail.get('documenti', []))} doc"
                 )
-                return "OK"
 
             except Exception as e:
-                log.error(f"  ✗ {url[:80]}: {e}")
+                log.error(f"  ✗ {pvp_id}: {e}")
                 self.stats["errors"] += 1
-                return "ERROR"
 
 
-# ── Parsing HTML lista ────────────────────────────────────────────────
-def _parse_list_html(html: str) -> tuple[list[dict], int]:
-    """
-    Estrae stub di annunci dalla pagina lista.
-    I selettori vanno verificati con tests/inspect_selectors.py.
-    """
-    from bs4 import BeautifulSoup
-    soup  = BeautifulSoup(html, "html.parser")
-    cards = (
-        soup.select(".annuncio-item") or soup.select(".card-lotto") or
-        soup.select("[data-lotto-id]") or soup.select("article.lotto") or
-        soup.select(".risultato-asta") or soup.select(".lotto-card")
-    )
-
-    stubs = [s for s in (_stub_from_card(c) for c in cards) if s]
-
-    # Totale risultati
-    total = 0
-    for sel in [".totale-risultati", "[class*='totale']", "h2", "h3"]:
-        el = soup.select_one(sel)
-        if el:
-            nums = re.findall(r"\d+", el.get_text().replace(".", ""))
-            if nums and int(nums[0]) > 10:
-                total = int(nums[0])
-                break
-
-    log.info(f"  Cards: {len(stubs)} | Totale dichiarato: {total}")
-    return stubs, total
-
-
-def _stub_from_card(card) -> Optional[dict]:
-    link = (
-        card.select_one("a[href*='/annuncio']") or
-        card.select_one("a[href*='/lotto']") or
-        card.select_one("a[href]")
-    )
-    if not link:
+def _parse_disponibilita(disp: list) -> Optional[str]:
+    if not disp:
         return None
-    url    = urljoin(BASE_URL, link["href"])
-    pvp_id = card.get("data-lotto-id") or card.get("data-id") or _id_from_url(url)
-
-    data_pub = None
-    for sel in ["time", "[class*='data']", "[class*='date']"]:
-        el = card.select_one(sel)
-        if el:
-            data_pub = _parse_date(el.get("datetime") or el.get_text(strip=True))
-            if data_pub:
-                break
-
-    return {"pvp_id": pvp_id, "url_dettaglio": url, "data_pubblicazione": data_pub}
+    vals = [str(d).upper() for d in disp]
+    if all("LIBER" in v for v in vals):
+        return "Libero"
+    if any("OCCUP" in v for v in vals):
+        return "Occupato"
+    return "Parzialmente libero"
 
 
-# ── Parsing HTML dettaglio ────────────────────────────────────────────
 def _parse_detail_html(html: str, url: str) -> dict:
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, "html.parser")
-    d    = {"url_dettaglio": url, "pvp_id": _id_from_url(url)}
+    d    = {"documenti": []}
 
-    def val(label: str) -> Optional[str]:
+    # Allegati PDF
+    seen = set()
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        if not href:
+            continue
+        if ".pdf" in href.lower() or "scarica" in href.lower() or "allegat" in href.lower():
+            full_url = urljoin(BASE_URL, href)
+            if full_url not in seen:
+                seen.add(full_url)
+                nome = a.get_text(strip=True) or href.split("/")[-1]
+                d["documenti"].append({
+                    "nome": nome[:200],
+                    "url":  full_url,
+                    "tipo": _classify_doc(nome + href),
+                })
+
+    # Campi aggiuntivi dal dettaglio HTML
+    def val(label):
         for dt in soup.find_all("dt"):
             if re.search(label, dt.get_text(), re.I):
                 dd = dt.find_next_sibling("dd")
-                if dd: return dd.get_text(strip=True)
-        for th in soup.find_all("th"):
-            if re.search(label, th.get_text(), re.I):
-                td = th.find_next_sibling("td")
-                if td: return td.get_text(strip=True)
-        for el in soup.find_all(text=re.compile(label, re.I)):
-            sib = el.parent.find_next_sibling()
-            if sib:
-                t = sib.get_text(strip=True)
-                if t and len(t) < 200: return t
+                if dd:
+                    return dd.get_text(strip=True)
         return None
 
-    h1 = soup.select_one("h1, .titolo-asta, .lotto-title, .annuncio-title")
-    d["titolo"]           = h1.get_text(strip=True) if h1 else None
-    d["tribunale"]        = val(r"Tribunale")
-    d["numero_procedura"] = val(r"Procedura|R\.G\.E\.|RGE|Numero proc")
-    d["lotto"]            = val(r"\bLotto\b")
-    d["tipo_asta"]        = val(r"Tipo.*(asta|procedura)|Esecuzione")
-    d["tipologia"]        = val(r"Tipolog|Categor|Tipo.*bene|Tipo.*immobile")
-    d["indirizzo"]        = val(r"Indirizzo|Via\b|Strada\b")
-    d["comune"]           = val(r"\bComune\b|\bCittà\b")
-    d["provincia"]        = val(r"\bProvincia\b")
-    d["regione"]          = val(r"\bRegione\b")
-    d["cap"]              = val(r"\bCAP\b|Codice postale")
-    d["latitudine"]       = _extract_coord(soup, html, "lat")
-    d["longitudine"]      = _extract_coord(soup, html, r"lng|lon")
-    d["mq"]               = _num(val(r"Superficie|mq\b|m²"))
-    d["vani"]             = _num(val(r"\bVani\b"))
-    d["piano"]            = val(r"\bPiano\b")
-    d["nr_locali"]        = _int(val(r"Locali|Stanze|Vani abitativi"))
-    d["nr_bagni"]         = _int(val(r"Bagni|Servizi"))
-    d["nr_posti_auto"]    = _int(val(r"Posto auto|Garage|Parcheggio"))
-    d["foglio"]           = val(r"\bFoglio\b")
-    d["particella"]       = val(r"Particella|Mappale")
-    d["subalterno"]       = val(r"Subalterno|Sub\b")
-    d["occupazione"]      = val(r"Occup|Disponibilit")
-    d["prezzo_base"]      = _num(val(r"Prezzo base|Base d.asta|Valore stimato"))
-    d["offerta_minima"]   = _num(val(r"Offerta minima"))
-    d["rialzo_minimo"]    = _num(val(r"Rilancio|Rialzo minimo"))
-    d["tipo_vendita"]     = val(r"Tipo.*vendita")
-    d["modalita_vendita"] = val(r"Modalit|Sincrona|Asincrona|Telematica")
-    d["data_vendita"]     = _parse_date(val(r"Data.*vendita|Data.*asta|Udienza"))
-    d["data_pubblicazione"] = _parse_date(val(r"Pubblicaz|Pubblicato il"))
-    d["data_scadenza"]    = _parse_date(val(r"Scadenza|Termine.*offert"))
-    d["giudice"]          = val(r"\bGiudice\b")
-    d["delegato"]         = val(r"Delegato|Professionista|Notaio")
-    d["custode"]          = val(r"\bCustode\b")
-    d["custode_tel"]      = val(r"Tel.*custode|Cellulare")
-    d["custode_email"]    = _find_email(soup)
-    desc = soup.select_one(".descrizione,.description,[class*='descr'],.testo-annuncio")
-    d["descrizione"]      = desc.get_text(separator=" ", strip=True) if desc else None
-    d["documenti"]        = _extract_docs(soup)
+    d["tipo_vendita"]     = val(r"Tipologia.*vendita|Tipo.*vendita")
+    d["modalita_vendita"] = val(r"Modalit")
+    d["data_scadenza"]    = val(r"Termine.*offert|Scadenza")
+    d["giudice"]          = val(r"Giudice")
+    d["delegato"]         = val(r"Delegato|Curatore|Soggetto specializzato")
+    d["custode"]          = val(r"Custode")
+
     return d
-
-
-def _extract_docs(soup) -> list[dict]:
-    docs, seen = [], set()
-    for a in soup.select("a[href]"):
-        href = a.get("href", "")
-        if not href: continue
-        if ".pdf" in href.lower() or any(
-            k in href.lower() for k in ["allegat","document","perizia","avviso","planimetri","download"]
-        ):
-            url = urljoin(BASE_URL, href)
-            if url in seen: continue
-            seen.add(url)
-            nome = a.get_text(strip=True) or href.split("/")[-1]
-            tipo = _classify_doc(nome + href)
-            docs.append({"nome": nome[:200], "url": url, "tipo": tipo})
-    return docs
 
 
 def _classify_doc(s: str) -> str:
@@ -356,47 +243,6 @@ def _classify_doc(s: str) -> str:
     if "perizia"    in s: return "perizia"
     if "avviso"     in s: return "avviso_vendita"
     if "planimetri" in s: return "planimetria"
-    if "foto"       in s: return "fotografia"
     if "relazione"  in s: return "relazione"
     if "ordinanza"  in s: return "ordinanza"
-    if "decreto"    in s: return "decreto"
     return "allegato"
-
-
-def _extract_coord(soup, html: str, pattern: str) -> Optional[str]:
-    for el in soup.find_all(True):
-        for attr in ["data-lat","data-latitude","data-lng","data-lon","data-longitude"]:
-            if re.search(pattern, attr, re.I) and el.get(attr):
-                return el[attr]
-    m = re.search(rf'["\']?{pattern}["\']?\s*[:=]\s*([+-]?\d{{1,3}}\.\d+)', html)
-    return m.group(1) if m else None
-
-
-def _find_email(soup) -> Optional[str]:
-    m = re.search(r"[\w.+-]+@[\w-]+\.\w+", soup.get_text())
-    return m.group() if m else None
-
-
-def _id_from_url(url: str) -> Optional[str]:
-    m = re.search(r"/(\d{4,})", url)
-    return m.group(1) if m else None
-
-
-def _num(s: Optional[str]) -> Optional[float]:
-    if not s: return None
-    c = re.sub(r"[^\d,.]", "", s).replace(".", "").replace(",", ".")
-    try: return float(c)
-    except ValueError: return None
-
-
-def _int(s: Optional[str]) -> Optional[int]:
-    n = _num(s)
-    return int(n) if n is not None else None
-
-
-def _parse_date(s: Optional[str]) -> Optional[str]:
-    if not s: return None
-    for fmt in ["%d/%m/%Y","%d-%m-%Y","%Y-%m-%d","%d/%m/%Y %H:%M","%d/%m/%Y %H:%M:%S"]:
-        try: return datetime.strptime(s.strip()[:19], fmt).isoformat()
-        except ValueError: continue
-    return s.strip()[:30]

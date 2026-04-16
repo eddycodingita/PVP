@@ -10,7 +10,7 @@ import logging
 from typing import Optional
 
 from db.client import db_get_all_active_pvp_ids, db_mark_inactive
-from utils.http import http_get_with_retry
+from utils.pvp_http import http_get_with_retry
 
 log = logging.getLogger("reconciler")
 

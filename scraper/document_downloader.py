@@ -18,7 +18,7 @@ from typing import Optional
 import pdfplumber
 
 from db.client import db_get_documenti_da_scaricare, db_update_documento, get_supabase
-from utils.http import http_get_with_retry
+from utils.pvp_http import http_get_with_retry
 
 log = logging.getLogger("downloader")
 

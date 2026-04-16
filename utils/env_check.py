@@ -92,7 +92,7 @@ def _check_formats() -> bool:
         ok = False
 
     sb_key = os.environ.get("SUPABASE_SERVICE_KEY", "")
-    if sb_key and not sb_key.startswith("eyJ"):
+    if sb_key and not sb_key.startswith("eyJ") and not sb_key.startswith("sb_secret_"):
         log.warning("  ⚠ SUPABASE_SERVICE_KEY non sembra un JWT valido")
         ok = False
 
@@ -110,10 +110,9 @@ def _test_supabase() -> bool:
             os.environ["SUPABASE_SERVICE_KEY"],
         )
         # Query leggera: conta le righe della tabella aste (anche 0 va bene)
-        res = sb.table("aste").select("id", count="exact", head=True).limit(1).execute()
+        res = sb.table("aste").select("id").limit(1).execute()
         ms = int((time.time() - t0) * 1000)
-        count = res.count or 0
-        log.info(f"  ✓ Supabase OK ({ms}ms) — aste in DB: {count:,}")
+        log.info(f"  ✓ Supabase OK ({ms}ms)")
         return True
     except Exception as e:
         err = str(e)
