@@ -20,13 +20,17 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.11", cache: pip }
 
-      # #3 — Tesseract per OCR PDF scansionati
-      - name: Install system deps (Tesseract + Poppler)
-        run: sudo apt-get install -y tesseract-ocr tesseract-ocr-ita poppler-utils
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-ita poppler-utils
 
       - run: pip install -r requirements.txt
-      - run: python -m playwright install chromium
-	- run: sudo apt-get install -y libasound2t64 || true
+
+      - name: Install Playwright + deps
+        run: |
+          python -m playwright install chromium
+          sudo apt-get install -y libasound2t64 libgbm1 libxkbcommon0 || true
 
       - name: Run pipeline
         env:
