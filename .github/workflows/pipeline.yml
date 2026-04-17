@@ -37,7 +37,8 @@ jobs:
           RESEND_API_KEY:        ${{ secrets.RESEND_API_KEY }}
           ALERT_FROM_EMAIL:      ${{ secrets.ALERT_FROM_EMAIL }}
         run: python scheduler/daily_pipeline.py --${{ github.event.inputs.mode || 'daily' }}
-	- name: Telegram notify
+
+      - name: Telegram notify
         if: always()
         env:
           SUPABASE_URL:         ${{ secrets.SUPABASE_URL }}
@@ -45,6 +46,7 @@ jobs:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python interface/telegram_notify.py
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
